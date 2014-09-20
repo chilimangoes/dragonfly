@@ -28,18 +28,17 @@ SAPI 5 engine class
 #---------------------------------------------------------------------------
 
 import time
-import win32con
 from ctypes import *
 
+import win32con
 from win32com.client           import Dispatch, getevents, constants
 from win32com.client.gencache  import EnsureDispatch
-from pywintypes                import com_error
 
 from ..base                    import EngineBase, EngineError
 from .compiler                 import Sapi5Compiler
 from .dictation                import Sapi5DictationContainer
 from .recobs                   import Sapi5RecObsManager
-#from .timer                    import NatlinkTimerManager
+
 from ...grammar.state          import State
 from ...windows.window         import Window
 
@@ -61,7 +60,7 @@ class MSG(Structure):
 
 #===========================================================================
 
-class Sapi5Engine(EngineBase):
+class Sapi5SharedEngine(EngineBase):
     """ Speech recognition engine back-end for SAPI 5. """
 
     _name = "sapi5"
@@ -79,7 +78,7 @@ class Sapi5Engine(EngineBase):
         self._compiler    = None
 
         self._recognition_observer_manager = Sapi5RecObsManager(self)
-#        self._timer_manager = NatlinkTimerManager(0.02, self)
+        # self._timer_manager = NatlinkTimerManager(0.02, self)
 
     def connect(self):
         """ Connect to back-end SR engine. """
@@ -119,9 +118,9 @@ class Sapi5Engine(EngineBase):
         handle.State = constants.SGSEnabled
         for rule in grammar.rules:
             handle.CmdSetRuleState(rule.name, constants.SGDSActive)
-#        self.activate_grammar(grammar)
-#        for l in grammar.lists:
-#            l._update()
+        # self.activate_grammar(grammar)
+        # for l in grammar.lists:
+        #     l._update()
         handle.CmdSetRuleState("_FakeRule", constants.SGDSActive)
 
         return wrapper
@@ -178,7 +177,7 @@ class Sapi5Engine(EngineBase):
                         % (grammar.name, exclusive))
         grammar_handle = self._get_grammar_wrapper(grammar).handle
         grammar_handle.State = constants.SGSExclusive
-#        grammar_handle.SetGrammarState(constants.SPGS_EXCLUSIVE)
+        # grammar_handle.SetGrammarState(constants.SPGS_EXCLUSIVE)
 
 
     #-----------------------------------------------------------------------
@@ -205,7 +204,7 @@ class Sapi5Engine(EngineBase):
             begin_time = time.time()
             timed_out = False
             windll.user32.SetTimer(NULL, NULL, int(timeout * 1000), NULL)
-    
+        
         message = MSG()
         message_pointer = pointer(message)
 
@@ -230,6 +229,55 @@ class Sapi5Engine(EngineBase):
         return not timed_out
 
 
+class Sapi5InProcEngine(Sapi5SharedEngine):
+    def __init__(self, default_audio_source=0):
+        Sapi5SharedEngine.__init__(self)
+
+        # Also ensure the dispatch to InProcReco
+        EnsureDispatch("SAPI.SpInProcRecognizer")
+
+        self._audio_source_qualifier = default_audio_source
+
+    def connect(self):
+        """ Connect to back-end SR engine. """
+        self._recognizer = Dispatch("SAPI.SpInProcRecognizer")
+        self.select_audio_source(self._audio_source_qualifier)
+        self._speaker = Dispatch("SAPI.SpVoice")
+        self._compiler = Sapi5Compiler()
+
+    def select_audio_source(self, audio_source_qualifier=0):
+        """ Changes the audio input of the device to the
+            device matching the audio source qualifier.
+            The qualifier is either a number (the index of the
+            audio device) or a string (to match against the
+            device descriptions).
+        """
+
+        sources = self._recognizer.GetAudioInputs()
+        token = None
+        if isinstance(audio_source_qualifier, int):
+            if audio_source_qualifier >= sources.Count:
+                raise EngineError("Asked to select audio source %s but only %s were available." % (
+                    audio_source_qualifier, sources.Count))
+            token = sources.Item(audio_source_qualifier)
+
+        if isinstance(audio_source_qualifier, basestring):
+            for source in collection_iter(sources):
+                if audio_source_qualifier in source.GetDescription():
+                    token = source
+                    break
+
+        if not token:
+            raise EngineError("No suitable Audio Source Token found given qualifier %s" % audio_source_qualifier)
+
+        self._recognizer.AudioInput = token
+
+
+class Sapi5Engine(Sapi5SharedEngine):
+    """ Sets the default SAPI Engine. """
+    pass
+
+
 #---------------------------------------------------------------------------
 # Utility generator function for iterating over COM collections.
 
@@ -243,7 +291,6 @@ def collection_iter(collection):
 #---------------------------------------------------------------------------
 
 class GrammarWrapper(object):
-
     def __init__(self, grammar, handle, context, engine):
         self.grammar = grammar
         self.handle = handle
@@ -252,7 +299,9 @@ class GrammarWrapper(object):
 
         # Register callback functions which will handle recognizer events.
         base = getevents("SAPI.SpSharedRecoContext")
-        class ContextEvents(base): pass
+        class ContextEvents(base):
+            pass
+
         c = ContextEvents(context)
         c.OnPhraseStart = self.phrase_start_callback
         c.OnRecognition = self.recognition_callback
@@ -285,8 +334,10 @@ class GrammarWrapper(object):
             # Walk the tree of child rules and put their names in the list.
             stack = [collection_iter(phrase_info.Rule.Children)]
             while stack:
-                try: element = stack[-1].next()
-                except StopIteration: stack.pop(); continue
+                try:
+                    element = stack[-1].next()
+                except StopIteration:
+                    stack.pop(); continue
                 name = element.Name
                 start = element.FirstElement
                 count = element.NumberOfElements
